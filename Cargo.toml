@@ -1,0 +1,8 @@
+[package]
+name = "abstract_alloc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rawpointer = "0.2.1"
+static_assertions = "1.1.0"
