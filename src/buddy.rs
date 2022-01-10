@@ -1,5 +1,3 @@
-//! See http://bitsquid.blogspot.com/2015/08/allocation-adventures-3-buddy-allocator.html
-
 use core::alloc::{AllocError, Allocator, Layout};
 use core::{mem, ptr};
 
@@ -35,7 +33,7 @@ impl LLHeader {
 
 /// Given a block of memory, and a minimal block size, subdivides
 /// the memory region into a binary tree of power-of-two-bytes sized
-/// blocks.
+/// blocks. This is a base-level allocator that manges it's bookkeeping memory.
 ///
 /// This is not a good choice for `#[global_allocator]`, but is excellent
 /// option for allocating physical page frames in a kernel.
@@ -49,7 +47,10 @@ impl LLHeader {
 /// constant time over allocation size, giving caller a concrete upper bound
 /// on performed operations.
 ///
-/// /// This is a base-level allocator that manges it's bookkeeping memory.
+///
+/// See http://bitsquid.blogspot.com/2015/08/allocation-adventures-3-buddy-allocator.html
+/// for a better explanation of what this does. Only instead, we live in the Rust world,
+/// where allocator is told the size of memory block on `deallocate`.
 ///
 /// ## Example
 ///
@@ -59,16 +60,16 @@ impl LLHeader {
 ///           |---------------------------|---------------------------|
 /// Upper     | 0                         | 1                         |
 ///           |-------------|-------------|-------------|-------------|
-/// Middle    | 0.0         | 0.1         | 1.1         | 1.2         |
+/// Middle    | 0.0         | 0.1         | 1.0         | 1.1         |
 ///           |------|------|------|------|             |------|------|
-/// Lower     | 0.0.0| 0.0.1| 0.1.0| 0.1.1|      |      | 1.2.0| 1.2.1|
+/// Lower     | 0.0.0| 0.0.1| 0.1.0| 0.1.1|      |      | 1.1.0| 1.1.1|
 ///           |-|----|----|-|--|---|--|---|------|------|---|--|--|---|
 ///             |         |   free   free        |        used   free
 ///        bookkeeping    |                  used (C)      (D)
 ///        frame (A)    used (B)
 /// ```
 ///
-/// Simple binary tree encoding for this tree is:
+/// Simple binary tree encoding for this tree would be:
 ///    AB    C D
 /// `001100001010`
 ///
@@ -82,8 +83,16 @@ impl LLHeader {
 ///
 /// Instead of trees, we use the first couple of bytes on free blocks to
 /// store pointers to previous and next free block. This way, the free blocks
-/// from a doubly-linked list.
+/// from a doubly-linked list. Then we simply store a pointer to some element
+/// of that list, and update that whenever an element is removed.
 ///
+/// In addition, we keep track of buddy pairs as a binary tree, stored in raw
+/// binary form with full representation (i.e. tree of n leafs takes 2^n+1 bits).
+/// For each buddy pair we store XOR-bit, that is true iff only one of the buddies.
+/// Therefore, whenever we free a node, we check the bit. If it's zero, we know
+/// that both buddies were allocated. If it's zero, the we can merge the buddy
+/// blocks before they are both free. This method is applied recursively, so
+/// that the merging propagates upwards.
 pub struct BuddyAllocator {
     /// Pointer to the beginning of an area
     base: ptr::NonNull<u8>,
