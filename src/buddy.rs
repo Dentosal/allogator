@@ -6,31 +6,50 @@ use core::{mem, ptr};
 use rawpointer::PointerExt;
 use static_assertions as sa;
 
+use crate::util::div_ceil;
+
 type OptPtr<T> = Option<ptr::NonNull<T>>;
 sa::assert_eq_size!(OptPtr<u8>, *mut u8);
 sa::assert_eq_size!(OptPtr<*mut u8>, *mut u8);
+
+#[cfg(feature = "extra-checks")]
+const HEADER_MAGIC: [u8; 8] = *b"LLHeader";
 
 /// A linked list header
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct LLHeader {
+    #[cfg(feature = "extra-checks")]
+    magic: [u8; 8],
     prev: OptPtr<LLHeader>,
     next: OptPtr<LLHeader>,
 }
 impl LLHeader {
     const EMPTY: Self = LLHeader {
+        #[cfg(feature = "extra-checks")]
+        magic: HEADER_MAGIC,
         prev: None,
         next: None,
     };
 }
 
-sa::assert_eq_size!(LLHeader, (*mut u8, *mut u8));
-
-/// Given a block of memory, and a fixed number of block sizes,
-/// subdivides the memory region into blocks, so that each block
-/// has it's own bitmap describing free blocks.
+/// Given a block of memory, and a minimal block size, subdivides
+/// the memory region into a binary tree of power-of-two-bytes sized
+/// blocks.
 ///
-/// This is a base-level allocator that manges it's bookkeeping memory.
+/// This is not a good choice for `#[global_allocator]`, but is excellent
+/// option for allocating physical page frames in a kernel.
+///
+/// The allocator has minimal overhead: 0.5 bits per `min_block` plus a pointer
+/// per level, meaning that the overhead with 4GiB of memory are and 4KiB `min_block`
+/// is about 0.0015% (`(((4<<30)//(4<<10))/2/8 + 20*8) / (4<<30) * 100`).
+///
+/// The operations are also fast. Worst-case complexity both allocation and
+/// deallocation is `O(log d)` (where `d = size/min_block`). Note that this is
+/// constant time over allocation size, giving caller a concrete upper bound
+/// on performed operations.
+///
+/// /// This is a base-level allocator that manges it's bookkeeping memory.
 ///
 /// ## Example
 ///
@@ -65,19 +84,9 @@ sa::assert_eq_size!(LLHeader, (*mut u8, *mut u8));
 /// store pointers to previous and next free block. This way, the free blocks
 /// from a doubly-linked list.
 ///
-///
-/// The allocator has minimal overhead: 0.5 bits per `min_block` plus a pointer
-/// per level, meaning that the overhead with 4GiB of memory are and 4KiB `min_block`
-/// is about 0.0015% (`(((4<<30)//(4<<10))/2/8 + 20*8) / (4<<30) * 100`).
-///
-/// The operations are also fast. Worst-case complexity both allocation and
-/// deallocation is `O(log d)` (where `d = size/min_block`). Note that this is
-/// constant time over allocation size, giving caller a concrete upper bound
-/// on performed operations.
-///
 pub struct BuddyAllocator {
     /// Pointer to the beginning of an area
-    storage: ptr::NonNull<u8>,
+    base: ptr::NonNull<u8>,
     /// Size of the area, in bytes
     /// This must be a power of two
     /// Max allocation is half of this
@@ -87,43 +96,45 @@ pub struct BuddyAllocator {
     min_block: usize,
 }
 impl BuddyAllocator {
-    pub unsafe fn new(mut storage: ptr::NonNull<u8>, size: usize, min_block: usize) -> Self {
+    pub fn new(storage: &mut [u8], min_block: usize) -> Self {
+        let size = storage.len();
+
+        debug_assert!(size >= 2);
         debug_assert!(size.is_power_of_two());
         debug_assert!(min_block.is_power_of_two());
         debug_assert!(min_block <= size / 2);
+        debug_assert!(min_block >= mem::size_of::<LLHeader>());
 
-        let result = Self {
-            storage,
+        let base = unsafe { ptr::NonNull::new_unchecked(storage.as_mut_ptr()) };
+        let mut result = Self {
+            base,
             size,
             min_block,
         };
 
-        #[cfg(test)]
-        println!("levels {}", result.levels());
-
-        #[cfg(test)]
-        println!("first_free_block {}", result.bookkeeping_size());
-
         let bk_size = result.bookkeeping_size();
         let ffb_level = result.block_level(bk_size);
-        debug_assert!(ffb_level != 0);
-        ptr::write_bytes(storage.as_mut(), 0, bk_size);
+        debug_assert!(
+            ffb_level != 0,
+            "Bookkeeping info requires the whole structure"
+        );
 
-        // Split left from this block and all blocks above it
+        // Zero put the bookkeeping area
+        // Safety: the pointer acquired from a slice is valid
+        unsafe {
+            ptr::write_bytes(result.base.as_mut(), 0, bk_size);
+        }
+
+        // Split all tops from top until this one, mark right side free
         for level in 1..(ffb_level + 1) {
-            #[cfg(test)]
-            println!("setup {}", level);
-
             let offset = result.block_size_on_level(level);
+            unsafe {
+                let mut free_area = result.base.add(offset).cast::<_>();
+                *free_area.as_mut() = LLHeader::EMPTY;
+                result.set_free_block_ptr_for(level, Some(free_area));
+                debug_assert_eq!(result.free_block_ptr_for(level), Some(free_area));
+            }
 
-            #[cfg(test)]
-            println!("offset {}", offset);
-
-            let free_area = storage.add(offset).cast::<_>();
-            *free_area.cast::<LLHeader>().as_mut() = LLHeader::EMPTY;
-            result.set_free_block_ptr_for(level, Some(free_area));
-
-            debug_assert_eq!(result.buddy_bit(level, 0), false);
             result.flip_buddy_bit(level, 0);
         }
 
@@ -144,20 +155,33 @@ impl BuddyAllocator {
     /// Level of a block
     fn block_level(&self, block_size: usize) -> usize {
         debug_assert!(block_size.is_power_of_two());
+        debug_assert!(block_size >= self.min_block);
+        debug_assert!(block_size <= self.size);
         (self.size / block_size).trailing_zeros() as usize
     }
 
     /// Level of a block
     fn block_size_on_level(&self, level: usize) -> usize {
+        assert!(level < self.levels());
         self.size / 2usize.pow(level as u32)
     }
 
     /// Level of a block
+    fn blocks_on_level(&self, level: usize) -> usize {
+        assert!(level != 0);
+        2usize.pow((level - 1) as u32)
+    }
+
+    /// Level of a block
     fn block_index_on_level(&self, level: usize, block: ptr::NonNull<u8>) -> usize {
-        let a = self.storage.as_ptr() as usize;
+        let a = self.base.as_ptr() as usize;
         let b = block.as_ptr() as usize;
         let offset = b - a;
         offset / self.block_size_on_level(level)
+    }
+
+    fn tree_bitmap_size_bytes(&self) -> usize {
+        div_ceil(1 << (self.levels() - 1), 8)
     }
 
     /// Bookkeeping data consists of two items;
@@ -166,10 +190,7 @@ impl BuddyAllocator {
     fn bookkeeping_size(&self) -> usize {
         // Level 0 doesn't need a pointer, as it never has free blocks
         let list_ptr_arr_size = (self.levels() - 1) * mem::size_of::<*mut u8>();
-        let tree_bitmap_size = 1 << (self.levels() - 1);
-        #[cfg(test)]
-        dbg!(self.levels(), tree_bitmap_size);
-        (list_ptr_arr_size + tree_bitmap_size)
+        (list_ptr_arr_size + self.tree_bitmap_size_bytes())
             .next_power_of_two()
             .max(self.min_block)
     }
@@ -179,13 +200,7 @@ impl BuddyAllocator {
             level != 0,
             "Level 0 has no free blocks, and no freelist ptr"
         );
-        unsafe {
-            *self
-                .storage
-                .cast::<OptPtr<LLHeader>>()
-                .add(level - 1)
-                .as_ptr()
-        }
+        unsafe { *self.base.cast::<OptPtr<LLHeader>>().add(level - 1).as_ptr() }
     }
 
     fn set_free_block_ptr_for(&self, level: usize, v: OptPtr<LLHeader>) {
@@ -194,41 +209,29 @@ impl BuddyAllocator {
             "Level 0 never has free blocks, and no freelist ptr either"
         );
         unsafe {
-            *self
-                .storage
-                .cast::<OptPtr<LLHeader>>()
-                .add(level - 1)
-                .as_mut() = v;
+            *self.base.cast::<OptPtr<LLHeader>>().add(level - 1).as_mut() = v;
         }
     }
 
     fn buddy_bitmap_start(&self) -> ptr::NonNull<u8> {
         unsafe {
-            self.storage
+            self.base
                 .cast::<OptPtr<LLHeader>>()
-                .add(self.levels())
+                .add(self.levels() - 1) // -1 ??
                 .cast()
         }
     }
 
     fn buddy_bit(&self, level: usize, bit_index: usize) -> bool {
         assert!(level != 0, "Level 0 has no buddy bitmap");
-
-        #[cfg(test)]
-        dbg!(level, self.buddy_bitmap_start());
+        debug_assert!(bit_index < self.blocks_on_level(level));
 
         let bitmap = self.buddy_bitmap_start();
-        let level_start_bit = 1 << (level - 1);
+        let level_start_bit = (1 << (level - 1)) - 1;
         let i = level_start_bit + bit_index;
         let byte = i / 8;
         let bit = i % 8;
         debug_assert!(byte < self.size); // Sanity check
-
-        #[cfg(test)]
-        dbg!(byte, i, unsafe { bitmap.add(byte) }, unsafe {
-            *bitmap.add(byte).as_mut()
-        });
-
         unsafe { (*bitmap.add(byte).as_mut()) & (1 << bit) != 0 }
     }
 
@@ -236,8 +239,10 @@ impl BuddyAllocator {
     /// This means that for `deallocate`, true means that the buddy was empty,
     /// and the empty blocks can now be merged.
     fn flip_buddy_bit(&self, level: usize, bit_index: usize) -> bool {
+        assert!(level != 0, "Level 0 has no buddy bitmap");
+        debug_assert!(bit_index < self.blocks_on_level(level));
         let bitmap = self.buddy_bitmap_start();
-        let level_start_bit = 1 << (level - 1);
+        let level_start_bit = (1 << (level - 1)) - 1;
         let i = level_start_bit + bit_index;
         let byte = i / 8;
         let bit = i % 8;
@@ -275,6 +280,12 @@ impl BuddyAllocator {
                 // Before
                 let mut cursor = fbp;
                 while let Some(p) = unsafe { cursor.as_ref().prev } {
+                    #[cfg(feature = "extra-checks")]
+                    assert_eq!(
+                        unsafe { cursor.as_mut() }.magic,
+                        HEADER_MAGIC,
+                        "Invalid header"
+                    );
                     cursor = p;
                     result += self.block_size_on_level(level);
                 }
@@ -282,6 +293,12 @@ impl BuddyAllocator {
                 // After
                 let mut cursor = fbp;
                 while let Some(p) = unsafe { cursor.as_ref().next } {
+                    #[cfg(feature = "extra-checks")]
+                    assert_eq!(
+                        unsafe { cursor.as_mut() }.magic,
+                        HEADER_MAGIC,
+                        "Invalid header"
+                    );
                     cursor = p;
                     result += self.block_size_on_level(level);
                 }
@@ -295,6 +312,8 @@ impl BuddyAllocator {
     pub fn dump_freelists(&self) {
         for level in 1..self.levels() {
             if let Some(fbp) = self.free_block_ptr_for(level) {
+                println!("?? {:?}", fbp);
+
                 let mut c = 0;
 
                 // Before
@@ -327,49 +346,50 @@ impl BuddyAllocator {
         }
     }
 
-    unsafe fn consume_free_block(&self, level: usize, mut block: ptr::NonNull<LLHeader>) -> bool {
+    #[cfg(test)]
+    pub fn tree_snapshot(&self) -> Vec<u8> {
+        let sz = self.tree_bitmap_size_bytes();
+        let mut result = vec![0; sz];
+        unsafe {
+            ptr::copy_nonoverlapping(self.buddy_bitmap_start().as_ptr(), result.as_mut_ptr(), sz);
+        }
+        result
+    }
+
+    unsafe fn consume_free_block(&self, level: usize, mut block: ptr::NonNull<LLHeader>) {
+        #[cfg(feature = "extra-checks")]
+        assert_eq!(block.as_mut().magic, HEADER_MAGIC, "Invalid header");
         let prev = block.as_mut().prev.take();
         let next = block.as_mut().next.take();
-
-        #[cfg(test)]
-        dbg!(prev, next);
 
         if let Some(mut p) = prev {
             (*p.as_mut()).next = next;
             if let Some(mut n) = next {
                 (*n.as_mut()).prev = Some(p);
             }
+            self.set_free_block_ptr_for(level, Some(p));
         } else if let Some(mut n) = next {
             (*n.as_mut()).prev = None;
+            self.set_free_block_ptr_for(level, Some(n));
         } else {
             // This is the last free block on this level
             self.set_free_block_ptr_for(level, None);
         }
-
-        self.flip_buddy_bit_for_block(level, block.cast())
     }
 
     /// Recursive helper for handling allocation
     fn allocate_on_level(&self, level: usize) -> Result<ptr::NonNull<u8>, AllocError> {
         if level == 0 {
-            #[cfg(test)]
-            println!("oom");
-
             // Out of memory; top-level block cannot be free as bookkeeping uses part of it
             Err(AllocError)
         } else if let Some(block) = self.free_block_ptr_for(level) {
-            #[cfg(test)]
-            println!("found {}", level);
-
             // This level has a free block, consume it
             unsafe {
                 self.consume_free_block(level, block);
             }
+            self.flip_buddy_bit_for_block(level, block.cast());
             Ok(block.cast())
         } else {
-            #[cfg(test)]
-            println!("trysplit {}", level);
-
             // This level has no blocks left, recursively allocate a block above this
             let block = self.allocate_on_level(level - 1)?;
 
@@ -378,14 +398,10 @@ impl BuddyAllocator {
             let size = self.block_size_on_level(level);
             unsafe {
                 let mut buddy: ptr::NonNull<LLHeader> = block.cast::<u8>().add(size).cast();
-                #[cfg(test)]
-                dbg!(buddy);
-                buddy.as_mut().prev = None; // Has no adjacent nodes
-                buddy.as_mut().next = None; // Has no adjacent nodes
+                *buddy.as_mut() = LLHeader::EMPTY;
                 self.set_free_block_ptr_for(level, Some(buddy));
             }
 
-            debug_assert_eq!(self.buddy_bit_for_block(level, block), false);
             self.flip_buddy_bit_for_block(level, block);
 
             Ok(block)
@@ -401,6 +417,7 @@ impl BuddyAllocator {
 
         let mut block: ptr::NonNull<LLHeader> = target.cast();
         let size = self.block_size_on_level(level);
+        debug_assert!(size >= self.min_block);
 
         if let Some(mut freelist_head) = self.free_block_ptr_for(level) {
             // This level has other free entries as well. We could simply
@@ -410,23 +427,24 @@ impl BuddyAllocator {
             let buddy_is_empty = self.flip_buddy_bit_for_block(level, block.cast());
             if buddy_is_empty {
                 // Merge adjacent empty blocks
-                let buddy: ptr::NonNull<LLHeader>;
-                if self.block_index_on_level(level, target) % 2 == 0 {
+                let buddy: ptr::NonNull<u8> = if self.block_index_on_level(level, target) % 2 == 0 {
                     // We are left, buddy is right
-                    buddy = unsafe { target.add(size).cast() };
+                    unsafe { target.add(size).cast() }
                 } else {
-                    // Buddy is left, We are right
-                    buddy = unsafe { target.sub(size).cast() };
-                }
-                let bb = self.flip_buddy_bit_for_block(level, buddy.cast());
-                debug_assert_eq!(bb, false);
+                    // Buddy is left, we are right
+                    unsafe { target.sub(size).cast() }
+                };
 
-                todo!("Bitmap optimization trick")
+                unsafe { self.consume_free_block(level, buddy.cast()) };
+
+                self.deallocate_on_level(target.min(buddy), level - 1);
             } else {
                 // Insert self to list of free blocks on this layer
                 unsafe {
                     let next = mem::replace(&mut freelist_head.as_mut().next, Some(block));
                     *block.as_mut() = LLHeader {
+                        #[cfg(feature = "extra-checks")]
+                        magic: HEADER_MAGIC,
                         prev: Some(freelist_head),
                         next,
                     }
@@ -439,7 +457,7 @@ impl BuddyAllocator {
             }
             self.set_free_block_ptr_for(level, Some(block));
 
-            debug_assert_eq!(self.buddy_bit_for_block(level, target), false);
+            debug_assert!(!self.buddy_bit_for_block(level, target));
             self.flip_buddy_bit_for_block(level, target);
         }
     }
@@ -457,16 +475,10 @@ unsafe impl Allocator for BuddyAllocator {
         );
 
         let level = self.block_level(req_size);
-        #[cfg(test)]
-        dbg!("tryalloc", level, req_size);
         let block = self.allocate_on_level(level)?;
-        #[cfg(test)]
-        dbg!("alloc ok", block, req_size);
         unsafe {
-            #[cfg(test)]
-            dbg!("alloc ck", block.add(req_size), self.storage.add(self.size));
             debug_assert!(
-                block.add(req_size) <= self.storage.add(self.size),
+                block.add(req_size) <= self.base.add(self.size),
                 "Attempting to return a block that's out-of-bounds"
             );
         }
@@ -481,7 +493,7 @@ unsafe impl Allocator for BuddyAllocator {
         };
 
         assert!(
-            ptr.add(req_size) <= self.storage.add(self.size),
+            ptr.add(req_size) <= self.base.add(self.size),
             "Deallocation outside memory area"
         );
 
@@ -501,13 +513,7 @@ mod tests_layered {
     #[test]
     fn internal_calculations() {
         let mut backing = [0; 1024];
-        let allocator = unsafe {
-            BuddyAllocator::new(
-                ptr::NonNull::new_unchecked(backing.as_mut_ptr()),
-                backing.len(),
-                128,
-            )
-        };
+        let allocator = BuddyAllocator::new(&mut backing, 128);
 
         assert_eq!(allocator.levels(), 4);
 
@@ -520,18 +526,85 @@ mod tests_layered {
         assert_eq!(allocator.block_level(512), 1);
         assert_eq!(allocator.block_level(256), 2);
         assert_eq!(allocator.block_level(128), 3);
+
+        #[cfg(not(feature = "extra-checks"))]
+        {
+            let mut backing = [0; 64];
+            let allocator = BuddyAllocator::new(&mut backing, 16);
+
+            assert_eq!(allocator.levels(), 3);
+
+            assert_eq!(allocator.block_size_on_level(0), 64);
+            assert_eq!(allocator.block_size_on_level(1), 32);
+            assert_eq!(allocator.block_size_on_level(2), 16);
+
+            assert_eq!(allocator.block_level(64), 0);
+            assert_eq!(allocator.block_level(32), 1);
+            assert_eq!(allocator.block_level(16), 2);
+        }
+
+        let mut backing = [0; 64];
+        let allocator = BuddyAllocator::new(&mut backing, 32);
+
+        assert_eq!(allocator.levels(), 2);
+
+        assert_eq!(allocator.block_size_on_level(0), 64);
+        assert_eq!(allocator.block_size_on_level(1), 32);
+
+        assert_eq!(allocator.block_level(64), 0);
+        assert_eq!(allocator.block_level(32), 1);
+
+        let mut backing = [0; 2048];
+        let allocator = BuddyAllocator::new(&mut backing, 32);
+
+        assert_eq!(allocator.levels(), 7);
+
+        assert_eq!(allocator.block_size_on_level(0), 2048);
+        assert_eq!(allocator.block_size_on_level(6), 32);
+
+        assert_eq!(allocator.block_level(2048), 0);
+        assert_eq!(allocator.block_level(32), 6);
+
+        let mut backing = vec![0; 1 << 20];
+        let allocator = BuddyAllocator::new(&mut backing, 4 << 10);
+
+        assert_eq!(allocator.levels(), 9);
+
+        assert_eq!(allocator.block_size_on_level(0), 1 << 20);
+        assert_eq!(allocator.block_size_on_level(8), 4 << 10);
+
+        assert_eq!(allocator.block_level(1 << 20), 0);
+        assert_eq!(allocator.block_level(4 << 10), 8);
+    }
+
+    #[test]
+    fn internal_buddy_bittree() {
+        let mut backing = vec![0; 64];
+        // Bypass initialization, create a truly empty state
+        let allocator = BuddyAllocator {
+            base: unsafe { ptr::NonNull::new_unchecked(backing.as_mut_ptr()) },
+            size: backing.len(),
+            min_block: 16,
+        };
+
+        let a = allocator.tree_snapshot();
+        allocator.flip_buddy_bit(1, 0);
+        allocator.flip_buddy_bit(1, 0);
+        assert_eq!(a, allocator.tree_snapshot());
+        allocator.flip_buddy_bit(1, 0);
+        assert_ne!(a, allocator.tree_snapshot());
+        allocator.flip_buddy_bit(2, 0);
+        allocator.flip_buddy_bit(3, 0);
+        allocator.flip_buddy_bit(1, 0);
+        allocator.flip_buddy_bit(2, 0);
+        allocator.flip_buddy_bit(3, 0);
+        assert_eq!(a, allocator.tree_snapshot());
     }
 
     #[test]
     fn simple() {
-        let mut backing = [0; 1024];
-        let allocator = unsafe {
-            BuddyAllocator::new(
-                ptr::NonNull::new_unchecked(backing.as_mut_ptr()),
-                backing.len(),
-                64,
-            )
-        };
+        let mut backing = vec![0; 1024];
+        let allocator = BuddyAllocator::new(&mut backing, 64);
 
         allocator.dump_freelists();
         assert_eq!(allocator.memory_available(), 1024 - 64);
@@ -598,15 +671,120 @@ mod tests_layered {
     }
 
     #[test]
+    fn merges_buddies() {
+        let mut backing = [0; 128];
+        let allocator = BuddyAllocator::new(&mut backing, 32);
+
+        let b0 = allocator
+            .allocate(Layout::from_size_align(32, 1).unwrap())
+            .expect("alloc");
+
+        let b1 = allocator
+            .allocate(Layout::from_size_align(32, 1).unwrap())
+            .expect("alloc");
+
+        // Now the subdivisions should look like this:
+        //          64               64
+        // |-----------------|-----------------|
+        // |      Split      |      Split      |
+        // |--------|--------|--------|--------|
+        // |Bookkeep|  Free  |   b0   |   b1   |
+        // |--------|--------|--------|--------|
+        //     32       32       32       32
+
+        assert_eq!(allocator.memory_available(), 32);
+
+        // Free both b0, b1 and make sure their parent region becomes available
+
+        unsafe {
+            allocator.deallocate(
+                b0.as_non_null_ptr(),
+                Layout::from_size_align(b0.len(), 1).unwrap(),
+            );
+            allocator.deallocate(
+                b1.as_non_null_ptr(),
+                Layout::from_size_align(b1.len(), 1).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn merges_propagate() {
+        let mut backing = [0; 256];
+        let allocator = BuddyAllocator::new(&mut backing, 32);
+
+        // Now the subdivisions should look like this:
+        //         128               128
+        // |-----------------|-----------------|
+        // |      Split      |      Free       | 128
+        // |--------|--------|-----------------|
+        // | Split  |  Free  |                 |  64
+        // |----+---|        |                 |
+        // |Book| F |        |                 |  32
+        // |----|---|--------|--------|--------|
+        //     32       32       32       32
+
+        // Consume left 128 completely
+        let _c0 = allocator
+            .allocate(Layout::from_size_align(32, 1).unwrap())
+            .expect("alloc");
+        let _c1 = allocator
+            .allocate(Layout::from_size_align(64, 1).unwrap())
+            .expect("alloc");
+
+        assert_eq!(allocator.memory_available(), 256 / 2);
+
+        // Reserve bottom-level slots on the right
+        let right = [
+            allocator
+                .allocate(Layout::from_size_align(32, 1).unwrap())
+                .expect("alloc"),
+            allocator
+                .allocate(Layout::from_size_align(32, 1).unwrap())
+                .expect("alloc"),
+            allocator
+                .allocate(Layout::from_size_align(32, 1).unwrap())
+                .expect("alloc"),
+            allocator
+                .allocate(Layout::from_size_align(32, 1).unwrap())
+                .expect("alloc"),
+        ];
+
+        // Now the subdivisions should look like this:
+        //         128               128
+        // |-----------------|-----------------|
+        // |      Split      |      Split      | 128
+        // |--------|--------|--------|--------|
+        // | Split  |  Used  |  Split | Split  |  64
+        // |----+---|  (c1)  |--------|--------|
+        // |Book|c0 |        | b0 |b1 | b2 |b3 |  32
+        // |----|---|--------|--------|--------|
+        //     32       32       32       32
+
+        assert_eq!(allocator.memory_available(), 0);
+
+        for r in right {
+            unsafe {
+                allocator.deallocate(
+                    r.as_non_null_ptr(),
+                    Layout::from_size_align(r.len(), 1).unwrap(),
+                );
+            }
+        }
+
+        // Ensure that the right side deallocation has propagated
+
+        assert_eq!(allocator.memory_available(), 256 / 2);
+
+        let _ = allocator
+            .allocate(Layout::from_size_align(128, 1).unwrap())
+            .expect("alloc");
+    }
+
+    #[test]
     fn pathological_fragmenter() {
         let mut backing = [0; 1024];
-        let allocator = unsafe {
-            BuddyAllocator::new(
-                ptr::NonNull::new_unchecked(backing.as_mut_ptr()),
-                backing.len(),
-                64,
-            )
-        };
+        let allocator = BuddyAllocator::new(&mut backing, 64);
 
         // Allocate all min-size blocks
         let mut blocks = Vec::new();
@@ -651,13 +829,7 @@ mod tests_layered {
     #[test]
     fn on_nonzeroed_memory() {
         let mut backing = [0xdd; 1024];
-        let allocator = unsafe {
-            BuddyAllocator::new(
-                ptr::NonNull::new_unchecked(backing.as_mut_ptr()),
-                backing.len(),
-                64,
-            )
-        };
+        let allocator = BuddyAllocator::new(&mut backing, 64);
 
         let a = allocator
             .allocate(Layout::from_size_align(64, 1).unwrap())
@@ -671,7 +843,7 @@ mod tests_layered {
             // Going deep into the implementation details here.
             // This check can be removed later if data in blocks is overwritten
             // by something more that the freelist pointers
-            assert_eq!(ptr::read(a.as_mut_ptr().add(20)), 0xdd);
+            assert_eq!(ptr::read(a.as_mut_ptr().add(0x20)), 0xdd);
 
             allocator.deallocate(
                 a.as_non_null_ptr(),
@@ -684,5 +856,52 @@ mod tests_layered {
         }
 
         assert_eq!(allocator.memory_available(), 1024 - 64);
+    }
+
+    #[test]
+    fn almost_fuzz() {
+        // for total_size in [64, 256, 1024] {
+        //     for min_block in [16, 32] {
+        for total_size in [256, 1024] {
+            for min_block in [32, 64, 128] {
+                println!(
+                    "Configuration: total_size={}, min_block={}",
+                    total_size, min_block
+                );
+                let mut backing = vec![0x12; total_size];
+                let allocator = BuddyAllocator::new(&mut backing, min_block);
+
+                let state = allocator.tree_snapshot();
+
+                for i in 0..3 {
+                    println!("########################## Round {} {:?}", i, state);
+                    allocator.dump_freelists();
+
+                    assert_eq!(
+                        state,
+                        allocator.tree_snapshot(),
+                        "Alloc-dealloc changed internal state"
+                    );
+
+                    let b = allocator
+                        .allocate(Layout::from_size_align(min_block, 1).unwrap())
+                        .expect("alloc");
+
+                    println!(
+                        "dealloc {:?}\n        {:?}",
+                        state,
+                        allocator.tree_snapshot()
+                    );
+                    allocator.dump_freelists();
+
+                    unsafe {
+                        allocator.deallocate(
+                            b.as_non_null_ptr(),
+                            Layout::from_size_align(b.len(), 1).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
