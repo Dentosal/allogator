@@ -4,7 +4,7 @@ use core::{mem, ptr};
 use rawpointer::PointerExt;
 use static_assertions as sa;
 
-use crate::util::div_ceil;
+use crate::util::{align_up, div_ceil};
 
 type OptPtr<T> = Option<ptr::NonNull<T>>;
 sa::assert_eq_size!(OptPtr<u8>, *mut u8);
@@ -470,19 +470,28 @@ impl BuddyAllocator {
             self.flip_buddy_bit_for_block(level, target);
         }
     }
-}
-unsafe impl Allocator for BuddyAllocator {
-    fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
-        let req_size = if layout.size() < self.min_block {
+
+    fn layout_to_block_size(&self, layout: Layout) -> usize {
+        let b = self.base.as_ptr() as usize;
+        assert!(
+            align_up(b, layout.align()) == b,
+            "Given alignment is too large for the base alignment of this allocator allocator"
+        );
+
+        // Ensure correct allocation by making sure the block size is at
+        // least one bit larger than the alignment
+        let align_min_block = (layout.align() + 1).next_power_of_two();
+
+        align_min_block.max(if layout.size() < self.min_block {
             self.min_block
         } else {
             layout.size().next_power_of_two()
-        };
-        assert!(
-            req_size <= self.size / 2,
-            "Trying to allocate too large block"
-        );
-
+        })
+    }
+}
+unsafe impl Allocator for BuddyAllocator {
+    fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
+        let req_size = self.layout_to_block_size(layout);
         let level = self.block_level(req_size);
         let block = self.allocate_on_level(level)?;
         unsafe {
@@ -495,17 +504,7 @@ unsafe impl Allocator for BuddyAllocator {
     }
 
     unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout: Layout) {
-        let req_size = if layout.size() < self.min_block {
-            self.min_block
-        } else {
-            layout.size().next_power_of_two()
-        };
-
-        assert!(
-            ptr.add(req_size) <= self.base.add(self.size),
-            "Deallocation outside memory area"
-        );
-
+        let req_size = self.layout_to_block_size(layout);
         debug_assert!(req_size <= self.size);
         let level = self.block_level(req_size);
         self.deallocate_on_level(ptr, level);
@@ -865,6 +864,32 @@ mod tests_layered {
         }
 
         assert_eq!(allocator.memory_available(), 1024 - 64);
+    }
+
+    #[test]
+    fn respects_alignment() {
+        use crate::util::align_up;
+
+        let mut backing = [0xdd; 2048];
+        let aligned = align_up(backing.as_mut_ptr() as usize, 1024);
+        let backing_slice = unsafe { core::slice::from_raw_parts_mut(aligned as *mut u8, 1024) };
+
+        let allocator = BuddyAllocator::new(backing_slice, 64);
+        let usable_memory = allocator.memory_available();
+
+        let layout = Layout::from_size_align(64, 256).unwrap();
+
+        let a = allocator.allocate(layout).expect("alloc");
+
+        let a_ptr_value = a.as_mut_ptr() as usize;
+        assert_eq!(align_up(a_ptr_value, 256), a_ptr_value);
+
+        unsafe {
+            allocator.deallocate(a.as_non_null_ptr(), layout);
+        }
+
+        // Check that frees all the memory
+        assert_eq!(allocator.memory_available(), usable_memory);
     }
 
     #[test]
