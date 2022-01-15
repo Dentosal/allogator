@@ -16,7 +16,7 @@ const HEADER_MAGIC: [u8; 8] = *b"LLHeader";
 /// A linked list header
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct LLHeader {
+struct LLHeader {
     #[cfg(feature = "extra-checks")]
     magic: [u8; 8],
     prev: OptPtr<LLHeader>,
@@ -95,14 +95,14 @@ impl LLHeader {
 /// that the merging propagates upwards.
 pub struct BuddyAllocator {
     /// Pointer to the beginning of an area
-    base: ptr::NonNull<u8>,
+    pub(crate) base: ptr::NonNull<u8>,
     /// Size of the area, in bytes
     /// This must be a power of two
     /// Max allocation is half of this
-    size: usize,
+    pub(crate) size: usize,
     /// Size of the area, in bytes
     /// This must be a power of two and >= sizeof(BookkeepHeader).
-    min_block: usize,
+    pub(crate) min_block: usize,
 }
 impl BuddyAllocator {
     pub fn new(storage: &mut [u8], min_block: usize) -> Self {
@@ -153,6 +153,10 @@ impl BuddyAllocator {
         }
 
         result
+    }
+
+    pub fn min_block(&self) -> usize {
+        self.min_block
     }
 
     /// size == (1<<num_levels) * min_block
@@ -512,7 +516,7 @@ unsafe impl Allocator for BuddyAllocator {
 }
 
 #[cfg(test)]
-mod tests_layered {
+mod tests {
     use core::alloc::{AllocError, Allocator, Layout};
     use core::ptr;
 
