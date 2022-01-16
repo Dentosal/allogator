@@ -78,6 +78,10 @@ impl BlockLLAllocator {
         result
     }
 
+    pub fn is_full(&self) -> bool {
+        self.next_free().is_none()
+    }
+
     fn next_free(&self) -> Option<ptr::NonNull<Option<ptr::NonNull<u8>>>> {
         let field = self.base.cast();
         unsafe { *field.as_ptr() }
