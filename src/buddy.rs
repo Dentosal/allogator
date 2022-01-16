@@ -104,6 +104,9 @@ pub struct BuddyAllocator {
     /// This must be a power of two and >= sizeof(BookkeepHeader).
     pub(crate) min_block: usize,
 }
+
+unsafe impl Send for BuddyAllocator {}
+
 impl BuddyAllocator {
     pub fn new(storage: &mut [u8], min_block: usize) -> Self {
         let size = storage.len();

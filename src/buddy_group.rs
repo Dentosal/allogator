@@ -70,6 +70,9 @@ pub struct BuddyGroupAllocator {
     /// Suballocator count, excluding the first one
     secondary_count: usize,
 }
+
+unsafe impl Send for BuddyGroupAllocator {}
+
 impl BuddyGroupAllocator {
     pub fn new(blocks: &mut [&mut [u8]], min_block: usize) -> Self {
         assert!(!blocks.is_empty(), "Empty input block group");
