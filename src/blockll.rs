@@ -54,6 +54,10 @@ impl BlockLLAllocator {
         result
     }
 
+    pub fn item_size(&self) -> usize {
+        self.item_size
+    }
+
     /// How many items this allocator can store
     pub fn capacity(&self) -> usize {
         (self.size / self.item_size) - 1
