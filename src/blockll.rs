@@ -1,6 +1,8 @@
 use core::alloc::AllocError;
 use core::{mem, ptr};
 
+use rawpointer::PointerExt;
+
 /// An allocator that can only handle items of a single fixed size, storing
 /// the bookkeeping into a linked list of free nodes. Has minimal overhead
 /// (only a single item) and does both allocation and deallocation in O(1).
@@ -9,8 +11,11 @@ use core::{mem, ptr};
 /// `free_ptr` points to a singly-linked list of free nodes.
 /// Each node has a pointer to the next free node. Null means end of list.
 pub struct BlockLLAllocator {
+    /// Pointer to the backing memory
     base: ptr::NonNull<u8>,
+    /// Size in bytes
     size: usize,
+    /// Size of a single item, in bytes
     item_size: usize,
 }
 
@@ -61,6 +66,12 @@ impl BlockLLAllocator {
     /// How many items this allocator can store
     pub fn capacity(&self) -> usize {
         (self.size / self.item_size) - 1
+    }
+
+    /// Check if a pointer is inside our backing memory.
+    /// This is used for building allocators on top of this one.
+    pub unsafe fn contains(&self, ptr: ptr::NonNull<u8>) -> bool {
+        self.base <= ptr && ptr < self.base.add(self.size)
     }
 
     /// Calculates free memory, in bytes. This is an expensive function,
