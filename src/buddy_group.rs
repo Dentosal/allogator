@@ -5,32 +5,30 @@ use core::{mem, ptr};
 use rawpointer::PointerExt;
 
 use super::BuddyAllocator;
+use crate::MemoryBlock;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct BuddyAllocatorStub {
-    base: ptr::NonNull<u8>,
-    size: usize,
+    storage: MemoryBlock,
 }
 impl BuddyAllocatorStub {
     fn new(buddy: BuddyAllocator) -> Self {
         Self {
-            base: buddy.base,
-            size: buddy.size,
+            storage: buddy.storage,
         }
     }
 
     fn expand(self, min_block: usize) -> BuddyAllocator {
         BuddyAllocator {
-            base: self.base,
-            size: self.size,
+            storage: self.storage,
             min_block,
         }
     }
 }
 
-fn split_into_pow2_regions<'a, A: Allocator>(
-    target: &mut alloc::vec::Vec<&'a mut [u8], A>,
-    source: &'a mut [u8],
+fn split_into_pow2_regions<A: Allocator>(
+    target: &mut alloc::vec::Vec<MemoryBlock, A>,
+    source: MemoryBlock,
     min_size: usize,
 ) {
     debug_assert!(min_size > 0);
@@ -46,7 +44,7 @@ fn split_into_pow2_regions<'a, A: Allocator>(
     }
 
     // Safety: index is always in-bounds, as per the above calculation
-    let (buddy_storage, leftover) = unsafe { source.split_at_mut_unchecked(buddysize) };
+    let (buddy_storage, leftover) = unsafe { source.split_at(buddysize) };
     target.push(buddy_storage);
     split_into_pow2_regions(target, leftover, min_size);
 }
@@ -65,7 +63,7 @@ fn split_into_pow2_regions<'a, A: Allocator>(
 pub struct BuddyGroupAllocator {
     /// Primary allocator used for bookkeeping and such
     primary: BuddyAllocator,
-    /// Suballocator count, excluding the first one
+    /// Pointer to bookkeeping of this allocator
     bookkeep_ptr: *const BuddyAllocatorStub,
     /// Suballocator count, excluding the first one
     secondary_count: usize,
@@ -74,7 +72,7 @@ pub struct BuddyGroupAllocator {
 unsafe impl Send for BuddyGroupAllocator {}
 
 impl BuddyGroupAllocator {
-    pub fn new(blocks: &mut [&mut [u8]], min_block: usize) -> Self {
+    pub fn new(blocks: &mut [MemoryBlock], min_block: usize) -> Self {
         assert!(!blocks.is_empty(), "Empty input block group");
 
         // Sort largest input blocks first
@@ -100,7 +98,7 @@ impl BuddyGroupAllocator {
             first_block.len().next_power_of_two() >> 1
         };
         // Safety: index is always in-bounds, as per the above calculation
-        let (buddy0_storage, leftover) = unsafe { first_block.split_at_mut_unchecked(buddysize) };
+        let (buddy0_storage, leftover) = unsafe { first_block.split_at(buddysize) };
 
         let buddy0 = BuddyAllocator::new(buddy0_storage, min_block);
 
@@ -111,7 +109,7 @@ impl BuddyGroupAllocator {
         // Partition each block into power-of-two-sized blocks
         while let Some((head, tail)) = blocks.split_first_mut() {
             blocks = tail;
-            split_into_pow2_regions(&mut areas, head, min_block * 2);
+            split_into_pow2_regions(&mut areas, *head, min_block * 2);
         }
 
         // Sort largest allocator blocks first
@@ -129,11 +127,6 @@ impl BuddyGroupAllocator {
 
         // Build buddy allocators from the blocks
         for (i, area) in areas.into_iter().enumerate() {
-            #[cfg(test)]
-            dbg!(area.len());
-            #[cfg(test)]
-            dbg!(BuddyAllocator::new(area, min_block).memory_available());
-
             // Safety: memory is allocated above
             unsafe {
                 ptr::write(
@@ -160,8 +153,6 @@ impl BuddyGroupAllocator {
         let mut result = self.primary.memory_available();
 
         for i in 0..self.secondary_count {
-            #[cfg(test)]
-            dbg!(i, result);
             // Safety: the loop keeps within bounds
             result += (unsafe { &*self.bookkeep_ptr.add(i) })
                 .expand(self.min_block())
@@ -174,8 +165,8 @@ impl BuddyGroupAllocator {
     /// Returns None for the primary allocator, and Some(index) for secondaries
     fn resolve_owner(&self, ptr: ptr::NonNull<u8>) -> Option<usize> {
         // Safety: invariants upheld by BuddyAllocator
-        let primary_end = unsafe { self.primary.base.add(self.primary.size) };
-        if self.primary.base <= ptr && ptr <= primary_end {
+        let primary_end = unsafe { self.primary.storage.nn().add(self.primary.size()) };
+        if self.primary.storage.nn() <= ptr && ptr <= primary_end {
             return None;
         }
 
@@ -183,8 +174,8 @@ impl BuddyGroupAllocator {
             // Safety: the loop keeps within bounds
             let secondary = (unsafe { &*self.bookkeep_ptr.add(i) }).expand(self.min_block());
             // Safety: invariants upheld by BuddyAllocator
-            let secondary_end = unsafe { secondary.base.add(secondary.size) };
-            if secondary.base <= ptr && ptr <= secondary_end {
+            let secondary_end = unsafe { secondary.storage.nn().add(secondary.size()) };
+            if secondary.storage.nn() <= ptr && ptr <= secondary_end {
                 return Some(i);
             }
         }
@@ -234,11 +225,10 @@ mod tests {
 
     #[test]
     fn simple() {
-        let mut backing1 = vec![0; 1024];
-        let mut backing2 = vec![0; 500];
-        let mut backing3 = vec![0; 200];
-        let allocator =
-            BuddyGroupAllocator::new(&mut [&mut backing1, &mut backing2, &mut backing3], 64);
+        let backing1 = MemoryBlock::test_new(1024);
+        let backing2 = MemoryBlock::test_new(500);
+        let backing3 = MemoryBlock::test_new(200);
+        let allocator = BuddyGroupAllocator::new(&mut [backing1, backing2, backing3], 64);
 
         assert!(allocator.memory_available() > 1200);
 
@@ -260,34 +250,54 @@ mod tests {
                 Layout::from_size_align(b0.len(), 1).unwrap(),
             );
         }
+
+        backing1.test_destroy();
+        backing2.test_destroy();
+        backing3.test_destroy();
     }
 
     #[test]
-    fn respects_alignment() {
-        use crate::util::align_up;
+    fn multiple() {
+        let backing1 = MemoryBlock::test_new(256);
+        let backing2 = MemoryBlock::test_new(128);
+        let backing3 = MemoryBlock::test_new(128);
+        let allocator = BuddyGroupAllocator::new(&mut [backing1, backing2, backing3], 64);
 
-        let mut backing = [0xdd; 2048];
-        let aligned = align_up(backing.as_mut_ptr() as usize, 1024);
-        let backing_slice = unsafe { core::slice::from_raw_parts_mut(aligned as *mut u8, 1024) };
+        dbg!(allocator.memory_available());
 
-        let mut backing_alternative = vec![0; 200];
-        let allocator =
-            BuddyGroupAllocator::new(&mut [backing_slice, &mut backing_alternative], 64);
+        let blocks: Vec<_> = (0..4)
+            .map(|_| {
+                allocator
+                    .allocate(Layout::from_size_align(64, 1).unwrap())
+                    .expect("alloc")
+            })
+            .collect();
 
-        let usable_memory = allocator.memory_available();
+        allocator
+            .allocate(Layout::from_size_align(64, 1).unwrap())
+            .expect_err("alloc should have failed");
 
-        let layout = Layout::from_size_align(64, 256).unwrap();
-
-        let a = allocator.allocate(layout).expect("alloc");
-
-        let a_ptr_value = a.as_mut_ptr() as usize;
-        assert_eq!(align_up(a_ptr_value, 256), a_ptr_value);
-
-        unsafe {
-            allocator.deallocate(a.as_non_null_ptr(), layout);
+        for block in &blocks {
+            // Check that we do not get a segfault or anything
+            unsafe {
+                ptr::write(block.as_mut_ptr(), 1);
+                assert_eq!(ptr::read(block.as_mut_ptr()), 1);
+            }
         }
 
-        // Check that frees all the memory
-        assert_eq!(allocator.memory_available(), usable_memory);
+        for block in blocks {
+            unsafe {
+                allocator.deallocate(
+                    block.as_non_null_ptr(),
+                    Layout::from_size_align(block.len(), 1).unwrap(),
+                );
+            }
+        }
+
+        dbg!(allocator.memory_available());
+
+        backing1.test_destroy();
+        backing2.test_destroy();
+        backing3.test_destroy();
     }
 }

@@ -3,6 +3,8 @@ use core::{mem, ptr};
 
 use rawpointer::PointerExt;
 
+use crate::MemoryBlock;
+
 /// An allocator that can only handle items of a single fixed size, storing
 /// the bookkeeping into a linked list of free nodes. Has minimal overhead
 /// (only a single item) and does both allocation and deallocation in O(1).
@@ -11,10 +13,7 @@ use rawpointer::PointerExt;
 /// `free_ptr` points to a singly-linked list of free nodes.
 /// Each node has a pointer to the next free node. Null means end of list.
 pub struct BlockLLAllocator {
-    /// Pointer to the backing memory
-    base: ptr::NonNull<u8>,
-    /// Size in bytes
-    size: usize,
+    storage: MemoryBlock,
     /// Size of a single item, in bytes
     item_size: usize,
 }
@@ -22,12 +21,12 @@ pub struct BlockLLAllocator {
 unsafe impl Send for BlockLLAllocator {}
 
 impl BlockLLAllocator {
-    pub fn new(block: &mut [u8], item_size: usize) -> Self {
+    pub fn new(block: MemoryBlock, item_size: usize) -> Self {
         assert!(!block.is_empty(), "Empty input block");
 
         assert!(
             block.len() % item_size == 0,
-            "backing block is not a multiple of item size"
+            "backing block is not a multiple of item block.len()"
         );
 
         assert!(
@@ -41,8 +40,7 @@ impl BlockLLAllocator {
         );
 
         let result = Self {
-            base: unsafe { ptr::NonNull::new_unchecked(block.as_mut_ptr()) },
-            size: block.len(),
+            storage: block,
             item_size,
         };
 
@@ -50,7 +48,7 @@ impl BlockLLAllocator {
         let mut prev: *mut u8 = ptr::null_mut();
         for i in (0..(result.capacity() + 1)).rev() {
             unsafe {
-                let ptr: *mut *mut u8 = block.as_mut_ptr().add(item_size * i).cast();
+                let ptr: *mut *mut u8 = result.storage.as_mut().add(item_size * i).cast();
                 *ptr = prev;
                 prev = ptr as *mut u8;
             }
@@ -59,19 +57,23 @@ impl BlockLLAllocator {
         result
     }
 
+    pub fn size(&self) -> usize {
+        self.storage.len()
+    }
+
     pub fn item_size(&self) -> usize {
         self.item_size
     }
 
     /// How many items this allocator can store
     pub fn capacity(&self) -> usize {
-        (self.size / self.item_size) - 1
+        (self.size() / self.item_size) - 1
     }
 
     /// Check if a pointer is inside our backing memory.
     /// This is used for building allocators on top of this one.
-    pub unsafe fn contains(&self, ptr: ptr::NonNull<u8>) -> bool {
-        self.base <= ptr && ptr < self.base.add(self.size)
+    pub fn contains(&self, ptr: ptr::NonNull<u8>) -> bool {
+        self.storage.nn() <= ptr && ptr < unsafe { self.storage.nn().add(self.size()) }
     }
 
     /// Calculates free memory, in bytes. This is an expensive function,
@@ -98,12 +100,12 @@ impl BlockLLAllocator {
     }
 
     fn next_free(&self) -> Option<ptr::NonNull<Option<ptr::NonNull<u8>>>> {
-        let field = self.base.cast();
+        let field = self.storage.nn().cast();
         unsafe { *field.as_ptr() }
     }
 
     fn set_next_free(&self, next_free: Option<ptr::NonNull<Option<ptr::NonNull<u8>>>>) {
-        let field = self.base.cast();
+        let field = self.storage.nn().cast();
         unsafe {
             *field.as_ptr() = next_free;
         }
@@ -124,7 +126,8 @@ impl BlockLLAllocator {
         Ok(free_ptr.cast())
     }
 
-    /// Safety: caller must ensure that the ptr was returned by this, and no double frees
+    /// # Safety
+    /// Caller must ensure that the ptr was returned by this, and no double frees.
     pub unsafe fn deallocate_one(&self, ptr: ptr::NonNull<u8>) {
         // Obtain previous free entry, if any
         let prev = self.next_free();
@@ -146,8 +149,8 @@ mod tests {
 
     #[test]
     fn simple() {
-        let mut backing = vec![0; 1024];
-        let allocator = BlockLLAllocator::new(&mut backing, 64);
+        let backing = MemoryBlock::test_new(1024);
+        let allocator = BlockLLAllocator::new(backing, 64);
 
         assert_eq!(allocator.capacity(), backing.len() / 64 - 1);
         assert_eq!(allocator.slots_available(), allocator.capacity());
@@ -163,12 +166,14 @@ mod tests {
         unsafe {
             allocator.deallocate_one(b0);
         }
+
+        backing.test_destroy();
     }
 
     #[test]
     fn use_full_capacity() {
-        let mut backing = vec![0xdd; 1024];
-        let allocator = BlockLLAllocator::new(&mut backing, 64);
+        let backing = MemoryBlock::test_new(1024);
+        let allocator = BlockLLAllocator::new(backing, 64);
 
         let mut blocks = Vec::new();
         for _ in 0..allocator.capacity() {
@@ -190,12 +195,13 @@ mod tests {
         }
 
         assert_eq!(allocator.slots_available(), allocator.capacity());
+        backing.test_destroy();
     }
 
     #[test]
     fn no_fragmentation() {
-        let mut backing = vec![0xdd; 1024];
-        let allocator = BlockLLAllocator::new(&mut backing, 8);
+        let backing = MemoryBlock::test_new(1024);
+        let allocator = BlockLLAllocator::new(backing, 8);
 
         let mut blocks = Vec::new();
         for _ in 0..allocator.capacity() {
@@ -217,13 +223,14 @@ mod tests {
         }
 
         assert_eq!(allocator.slots_available(), allocator.capacity());
+        backing.test_destroy();
     }
 
     #[test]
     fn almost_fuzz() {
         for (size, item_size) in [(16, 8), (64, 8), (128, 32)] {
-            let mut backing = vec![0xdd; size];
-            let allocator = BlockLLAllocator::new(&mut backing, item_size);
+            let backing = MemoryBlock::test_new(size);
+            let allocator = BlockLLAllocator::new(backing, item_size);
 
             for _ in 0..3 {
                 let pre = allocator.slots_available();
@@ -234,6 +241,8 @@ mod tests {
                 }
                 assert_eq!(allocator.slots_available(), pre);
             }
+
+            backing.test_destroy();
         }
     }
 }
