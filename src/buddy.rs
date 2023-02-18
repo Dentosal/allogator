@@ -14,22 +14,109 @@ sa::assert_eq_size!(OptPtr<*mut u8>, *mut u8);
 #[cfg(feature = "extra-checks")]
 const HEADER_MAGIC: [u8; 8] = *b"LLHeader";
 
-/// A linked list header
+/// Node in a doubly-linked list
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct LLHeader {
     #[cfg(feature = "extra-checks")]
     magic: [u8; 8],
+    #[cfg(feature = "extra-checks")]
+    addr: ptr::NonNull<LLHeader>,
+    #[cfg(feature = "extra-checks")]
+    level: usize,
     prev: OptPtr<LLHeader>,
     next: OptPtr<LLHeader>,
 }
 impl LLHeader {
-    const EMPTY: Self = LLHeader {
-        #[cfg(feature = "extra-checks")]
-        magic: HEADER_MAGIC,
-        prev: None,
-        next: None,
-    };
+    pub fn new(
+        #[cfg(feature = "extra-checks")] level: usize,
+        #[cfg(feature = "extra-checks")] addr: ptr::NonNull<Self>,
+    ) -> Self {
+        Self {
+            #[cfg(feature = "extra-checks")]
+            magic: HEADER_MAGIC,
+            #[cfg(feature = "extra-checks")]
+            addr,
+            #[cfg(feature = "extra-checks")]
+            level,
+            prev: None,
+            next: None,
+        }
+    }
+
+    /// Cycle detection using the classic fast/slow pointer algo
+    #[cfg(feature = "extra-checks")]
+    fn has_cycles(head: ptr::NonNull<Self>) -> bool {
+        let mut slow = head;
+        let mut fast = head;
+
+        // Before
+        while let Some(mut fp) = unsafe { fast.as_mut().prev } {
+            if let Some(p) = unsafe { fp.as_mut().prev } {
+                fast = p;
+            } else {
+                break;
+            }
+            slow = (unsafe { slow.as_mut().prev }).unwrap(); // Fast pointer checked this path already
+            if fast == slow {
+                return true;
+            }
+        }
+
+        let mut slow = head;
+        let mut fast = head;
+
+        // After
+        while let Some(mut fp) = unsafe { fast.as_mut().next } {
+            if let Some(p) = unsafe { fp.as_mut().next } {
+                fast = p;
+            } else {
+                break;
+            }
+            slow = (unsafe { slow.as_mut().next }).unwrap(); // Fast pointer checked this path already
+            if fast == slow {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Checks that next/prev ptrs are set up correctly
+    #[cfg(feature = "extra-checks")]
+    fn check_ptr_correctness(head: ptr::NonNull<Self>) {
+        // Before
+        let mut cursor = head;
+        while let Some(p) = unsafe { cursor.as_ref().prev } {
+            assert_eq!(unsafe { p.as_ref().next }, Some(cursor), "Invalid next ptr");
+            cursor = p;
+        }
+
+        // After
+        let mut cursor = head;
+        while let Some(p) = unsafe { cursor.as_ref().next } {
+            assert_eq!(unsafe { p.as_ref().prev }, Some(cursor), "Invalid prev ptr");
+            cursor = p;
+        }
+    }
+
+    #[cfg(feature = "extra-checks")]
+    fn do_checks(head: ptr::NonNull<Self>, level: usize) {
+        assert_eq!(
+            unsafe { *head.as_ptr() }.magic,
+            HEADER_MAGIC,
+            "Header magic mismatch"
+        );
+        assert_eq!(
+            unsafe { *head.as_ptr() }.level,
+            level,
+            "Header level mismatch"
+        );
+        assert_eq!(unsafe { *head.as_ptr() }.addr, head, "Header ptr mismatch");
+
+        assert!(!Self::has_cycles(head));
+        Self::check_ptr_correctness(head);
+    }
 }
 
 /// Given a block of memory, and a minimal block size, subdivides
@@ -137,7 +224,15 @@ impl BuddyAllocator {
             let offset = result.block_size_on_level(level);
             unsafe {
                 let mut free_area = result.storage.nn().add(offset).cast::<_>();
-                ptr::write(free_area.as_mut(), LLHeader::EMPTY);
+                ptr::write(
+                    free_area.as_mut(),
+                    LLHeader::new(
+                        #[cfg(feature = "extra-checks")]
+                        level,
+                        #[cfg(feature = "extra-checks")]
+                        free_area,
+                    ),
+                );
                 result.set_free_block_ptr_for(level, Some(free_area));
                 debug_assert_eq!(result.free_block_ptr_for(level), Some(free_area));
             }
@@ -215,6 +310,8 @@ impl BuddyAllocator {
             level != 0,
             "Level 0 has no free blocks, and no freelist ptr"
         );
+        debug_assert!(level <= self.levels());
+
         unsafe {
             ptr::read(
                 self.storage
@@ -232,13 +329,19 @@ impl BuddyAllocator {
             "Level 0 never has free blocks, and no freelist ptr either"
         );
         debug_assert!(level <= self.levels());
+
+        #[cfg(feature = "extra-checks")]
+        if let Some(p) = v {
+            LLHeader::do_checks(p, level)
+        }
+
         unsafe {
             ptr::write(
                 self.storage
                     .nn()
                     .cast::<OptPtr<LLHeader>>()
                     .add(level - 1)
-                    .as_mut(),
+                    .as_ptr(),
                 v,
             );
         }
@@ -313,11 +416,7 @@ impl BuddyAllocator {
                 let mut cursor = fbp;
                 while let Some(p) = unsafe { cursor.as_ref().prev } {
                     #[cfg(feature = "extra-checks")]
-                    assert_eq!(
-                        unsafe { cursor.as_mut() }.magic,
-                        HEADER_MAGIC,
-                        "Invalid header"
-                    );
+                    LLHeader::do_checks(cursor, level);
                     cursor = p;
                     result += self.block_size_on_level(level);
                 }
@@ -326,11 +425,7 @@ impl BuddyAllocator {
                 let mut cursor = fbp;
                 while let Some(p) = unsafe { cursor.as_ref().next } {
                     #[cfg(feature = "extra-checks")]
-                    assert_eq!(
-                        unsafe { cursor.as_mut() }.magic,
-                        HEADER_MAGIC,
-                        "Invalid header"
-                    );
+                    LLHeader::do_checks(cursor, level);
                     cursor = p;
                     result += self.block_size_on_level(level);
                 }
@@ -344,9 +439,12 @@ impl BuddyAllocator {
     pub fn dump_freelists(&self) {
         for level in 1..self.levels() {
             if let Some(fbp) = self.free_block_ptr_for(level) {
-                println!("?? {:?}", fbp);
+                #[cfg(feature = "extra-checks")]
+                LLHeader::do_checks(fbp, level);
 
-                let mut c = 0;
+                println!("?? {fbp:?}");
+
+                let mut c = 1;
 
                 // Before
                 let mut cursor = fbp;
@@ -354,6 +452,13 @@ impl BuddyAllocator {
                     cursor = p;
                     c += 1;
                 }
+
+                print!("Level {level} ptrs: {cursor:p}");
+                while let Some(p) = unsafe { cursor.as_ref().next } {
+                    print!(" {p:p}");
+                    cursor = p;
+                }
+                println!();
 
                 // After
                 let mut cursor = fbp;
@@ -363,10 +468,8 @@ impl BuddyAllocator {
                 }
 
                 println!(
-                    "Level {} ({:>4}): {:?}",
-                    level,
-                    self.block_size_on_level(level),
-                    c
+                    "Level {level} ({:>4}): total={c:?}",
+                    self.block_size_on_level(level)
                 );
             } else {
                 println!(
@@ -390,33 +493,36 @@ impl BuddyAllocator {
 
     unsafe fn consume_free_block(&self, level: usize, mut block: ptr::NonNull<LLHeader>) {
         #[cfg(feature = "extra-checks")]
-        assert_eq!(
-            block.as_mut().magic,
-            HEADER_MAGIC,
-            "Invalid header at {:p}",
-            block
-        );
+        LLHeader::do_checks(block, level);
+
         let prev = block.as_mut().prev.take();
         let next = block.as_mut().next.take();
 
         if let Some(mut p) = prev {
-            let mut p_item = ptr::read(p.as_ptr());
-            p_item.next = next;
-            ptr::write(p.as_mut(), p_item);
+            p.as_mut().next = next;
+
             if let Some(mut n) = next {
-                let mut n_item = ptr::read(n.as_ptr());
-                n_item.next = Some(p);
-                ptr::write(n.as_mut(), n_item);
+                n.as_mut().prev = Some(p);
             }
+
             self.set_free_block_ptr_for(level, Some(p));
         } else if let Some(mut n) = next {
-            let mut n_item = ptr::read(n.as_ptr());
-            n_item.prev = None;
-            ptr::write(n.as_mut(), n_item);
+            n.as_mut().prev = None;
+
             self.set_free_block_ptr_for(level, Some(n));
         } else {
             // This is the last free block on this level
             self.set_free_block_ptr_for(level, None);
+        }
+
+        #[cfg(feature = "extra-checks")]
+        if let Some(p) = prev {
+            LLHeader::do_checks(p, level);
+        }
+
+        #[cfg(feature = "extra-checks")]
+        if let Some(p) = next {
+            LLHeader::do_checks(p, level);
         }
     }
 
@@ -441,7 +547,15 @@ impl BuddyAllocator {
             let size = self.block_size_on_level(level);
             unsafe {
                 let mut buddy: ptr::NonNull<LLHeader> = block.cast::<u8>().add(size).cast();
-                ptr::write(buddy.as_mut(), LLHeader::EMPTY);
+                ptr::write(
+                    buddy.as_mut(),
+                    LLHeader::new(
+                        #[cfg(feature = "extra-checks")]
+                        level,
+                        #[cfg(feature = "extra-checks")]
+                        buddy,
+                    ),
+                );
                 self.set_free_block_ptr_for(level, Some(buddy));
             }
 
@@ -459,20 +573,22 @@ impl BuddyAllocator {
             panic!("Level 0 blocks cannot be deallocated externally");
         }
 
-        let mut block: ptr::NonNull<LLHeader> = target.cast();
+        let block: ptr::NonNull<LLHeader> = target.cast();
         let size = self.block_size_on_level(level);
         debug_assert!(size >= self.min_block);
 
-        if let Some(mut freelist_head) = self.free_block_ptr_for(level) {
+        if let Some(freelist_head) = self.free_block_ptr_for(level) {
             // This level has other free entries as well. We could simply
             // traverse the linked list of free blocks to obtain it's location,
             // but instead we are using a buddy XOR bitmap.
 
             #[cfg(feature = "extra-checks")]
             {
-                log::trace!("Checking for double-free");
+                LLHeader::do_checks(freelist_head, level);
 
                 // Extra check: double free detection
+                log::trace!("Checking for double-free");
+
                 assert_ne!(freelist_head, target.cast(), "Double free");
 
                 // Before
@@ -516,27 +632,82 @@ impl BuddyAllocator {
             } else {
                 // Insert self to list of free blocks on this layer
                 unsafe {
-                    let next = mem::replace(&mut freelist_head.as_mut().next, Some(block));
+                    #[cfg(feature = "extra-checks")]
+                    LLHeader::do_checks(freelist_head, level);
+
+                    // Adjust the pointed block, previous from the newly freed block
+                    let mut fh = ptr::read(freelist_head.as_ptr());
+                    #[cfg(feature = "extra-checks")]
+                    debug_assert_eq!(fh.magic, HEADER_MAGIC, "Header magic mismatch");
+                    #[cfg(feature = "extra-checks")]
+                    debug_assert_eq!(fh.level, level, "Header level mismatch");
+                    #[cfg(feature = "extra-checks")]
+                    debug_assert_eq!(fh.addr, freelist_head, "Header ptr mismatch");
+                    let next = fh.next.replace(block);
+                    ptr::write(freelist_head.as_ptr(), fh);
+
+                    // Write info to the now-free block
                     ptr::write(
-                        block.as_mut(),
+                        block.as_ptr(),
                         LLHeader {
                             #[cfg(feature = "extra-checks")]
                             magic: HEADER_MAGIC,
+                            #[cfg(feature = "extra-checks")]
+                            level,
+                            #[cfg(feature = "extra-checks")]
+                            addr: block,
                             prev: Some(freelist_head),
                             next,
                         },
                     );
+
+                    // Adjust the next block, next from the newly freed block, if it exists
+                    if let Some(n) = next {
+                        let mut ns = ptr::read(n.as_ptr());
+                        #[cfg(feature = "extra-checks")]
+                        debug_assert_eq!(ns.magic, HEADER_MAGIC, "Header magic mismatch");
+                        #[cfg(feature = "extra-checks")]
+                        debug_assert_eq!(fh.level, level, "Header level mismatch");
+                        #[cfg(feature = "extra-checks")]
+                        debug_assert_eq!(fh.addr, freelist_head, "Header ptr mismatch");
+                        ns.prev = Some(block);
+                        ptr::write(n.as_ptr(), ns);
+                    }
+
+                    #[cfg(feature = "extra-checks")]
+                    log::trace!("block = {:?}", block);
+                    log::trace!("[block] = {:?}", ptr::read(block.as_ptr()));
+                    log::trace!("frelh = {:?}", freelist_head);
+                    log::trace!("[frelh] = {:?}", ptr::read(freelist_head.as_ptr()));
+
+                    #[cfg(feature = "extra-checks")]
+                    LLHeader::do_checks(freelist_head, level);
+                    #[cfg(feature = "extra-checks")]
+                    LLHeader::do_checks(block, level);
                 }
             }
         } else {
             // No (other) free entries on this level
+            log::trace!("this is the only entry on this level");
+
             unsafe {
-                ptr::write(block.as_mut(), LLHeader::EMPTY);
+                ptr::write(
+                    block.as_ptr(),
+                    LLHeader::new(
+                        #[cfg(feature = "extra-checks")]
+                        level,
+                        #[cfg(feature = "extra-checks")]
+                        block,
+                    ),
+                );
             }
             self.set_free_block_ptr_for(level, Some(block));
 
             debug_assert!(!self.buddy_bit_for_block(level, target));
             self.flip_buddy_bit_for_block(level, target);
+
+            #[cfg(feature = "extra-checks")]
+            LLHeader::do_checks(block, level);
         }
     }
 
@@ -588,6 +759,9 @@ mod tests {
     use core::alloc::{AllocError, Allocator, Layout};
     use core::ptr;
 
+    use rand::seq::SliceRandom;
+    use rand::{Rng, SeedableRng};
+
     use super::*;
 
     #[test]
@@ -627,44 +801,52 @@ mod tests {
             backing.test_destroy();
         }
 
-        let backing = MemoryBlock::test_new(64);
-        let allocator = BuddyAllocator::new(backing, 32);
+        #[cfg(not(feature = "extra-checks"))]
+        {
+            let backing = MemoryBlock::test_new(64);
+            let allocator = BuddyAllocator::new(backing, 32);
 
-        assert_eq!(allocator.levels(), 2);
+            assert_eq!(allocator.levels(), 2);
 
-        assert_eq!(allocator.block_size_on_level(0), 64);
-        assert_eq!(allocator.block_size_on_level(1), 32);
+            assert_eq!(allocator.block_size_on_level(0), 64);
+            assert_eq!(allocator.block_size_on_level(1), 32);
 
-        assert_eq!(allocator.block_level(64), 0);
-        assert_eq!(allocator.block_level(32), 1);
+            assert_eq!(allocator.block_level(64), 0);
+            assert_eq!(allocator.block_level(32), 1);
 
-        backing.test_destroy();
+            backing.test_destroy();
+        }
 
-        let backing = MemoryBlock::test_new(2048);
-        let allocator = BuddyAllocator::new(backing, 32);
+        #[cfg(not(feature = "extra-checks"))]
+        {
+            let backing = MemoryBlock::test_new(2048);
+            let allocator = BuddyAllocator::new(backing, 32);
 
-        assert_eq!(allocator.levels(), 7);
+            assert_eq!(allocator.levels(), 7);
 
-        assert_eq!(allocator.block_size_on_level(0), 2048);
-        assert_eq!(allocator.block_size_on_level(6), 32);
+            assert_eq!(allocator.block_size_on_level(0), 2048);
+            assert_eq!(allocator.block_size_on_level(6), 32);
 
-        assert_eq!(allocator.block_level(2048), 0);
-        assert_eq!(allocator.block_level(32), 6);
+            assert_eq!(allocator.block_level(2048), 0);
+            assert_eq!(allocator.block_level(32), 6);
 
-        backing.test_destroy();
+            backing.test_destroy();
+        }
 
-        let backing = MemoryBlock::test_new(1 << 20);
-        let allocator = BuddyAllocator::new(backing, 4 << 10);
+        {
+            let backing = MemoryBlock::test_new(1 << 20);
+            let allocator = BuddyAllocator::new(backing, 4 << 10);
 
-        assert_eq!(allocator.levels(), 9);
+            assert_eq!(allocator.levels(), 9);
 
-        assert_eq!(allocator.block_size_on_level(0), 1 << 20);
-        assert_eq!(allocator.block_size_on_level(8), 4 << 10);
+            assert_eq!(allocator.block_size_on_level(0), 1 << 20);
+            assert_eq!(allocator.block_size_on_level(8), 4 << 10);
 
-        assert_eq!(allocator.block_level(1 << 20), 0);
-        assert_eq!(allocator.block_level(4 << 10), 8);
+            assert_eq!(allocator.block_level(1 << 20), 0);
+            assert_eq!(allocator.block_level(4 << 10), 8);
 
-        backing.test_destroy();
+            backing.test_destroy();
+        }
     }
 
     #[test]
@@ -792,6 +974,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "extra-checks"))]
     fn merges_buddies() {
         let backing = MemoryBlock::test_new(128);
         let allocator = BuddyAllocator::new(backing, 32);
@@ -832,6 +1015,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "extra-checks"))]
     fn merges_propagate() {
         let backing = MemoryBlock::test_new(256);
         let allocator = BuddyAllocator::new(backing, 32);
@@ -954,6 +1138,36 @@ mod tests {
     }
 
     #[test]
+    fn no_overlapping_blocks() {
+        let backing = MemoryBlock::test_new(1024);
+        let allocator = BuddyAllocator::new(backing, 64);
+
+        // Allocate all min-size blocks
+        let mut blocks = Vec::new();
+        for _ in 0..(1024 / 64 - 1) {
+            blocks.push(
+                allocator
+                    .allocate(Layout::from_size_align(64, 1).unwrap())
+                    .expect("alloc"),
+            );
+        }
+
+        assert_eq!(allocator.memory_available(), 0);
+
+        // Check that no blocks overlap
+        let mut starts = Vec::new();
+        for block in &blocks {
+            let intptr = block.as_mut_ptr() as u64;
+            for start in starts.iter().copied() {
+                assert!(start + 63 < intptr || intptr + 63 < start);
+            }
+            starts.push(intptr);
+        }
+
+        backing.test_destroy();
+    }
+
+    #[test]
     fn respects_alignment() {
         use crate::util::align_up;
 
@@ -989,23 +1203,21 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
 
         for (min_block, total_size) in [
+            #[cfg(not(feature = "extra-checks"))]
             (32, 256),
             (64, 256),
             (128, 256),
             (256, 1024),
             (4 << 10, 2 << 30),
         ] {
-            println!(
-                "Configuration: total_size={}, min_block={}",
-                total_size, min_block
-            );
+            println!("Configuration: total_size={total_size}, min_block={min_block}",);
             let backing = MemoryBlock::test_new(total_size);
             let allocator = BuddyAllocator::new(backing, min_block);
 
             let state = allocator.tree_snapshot();
 
             for i in 0..3 {
-                println!("########################## Round {} {:?}", i, state);
+                println!("########################## Round {i} {state:?}");
                 allocator.dump_freelists();
 
                 assert_eq!(
@@ -1032,6 +1244,74 @@ mod tests {
                     );
                 }
             }
+
+            backing.test_destroy();
+        }
+    }
+
+    #[test]
+    fn fuzzing() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let min_block = 4096;
+
+        for seed in 0..10 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+            let backing = MemoryBlock::test_new(1 << 29);
+            let allocator = BuddyAllocator::new(backing, min_block);
+            let usable_memory = allocator.memory_available();
+
+            let mut allocations: Vec<(ptr::NonNull<[u8]>, Layout)> = Vec::new();
+
+            for i in 0..1000 {
+                println!("============== {i} ==============");
+
+                let size = rng.gen_range(min_block..(1 << 16));
+                let align = 1 << rng.gen_range(1..4);
+
+                let layout = Layout::from_size_align(size, align).unwrap();
+
+                let block = allocator.allocate(layout).expect("alloc");
+
+                // Check for duplicate allocations
+                for al in &allocations {
+                    if al.0 == block {
+                        panic!("Duplicate allocation");
+                    }
+                }
+
+                allocations.push((block, layout));
+
+                allocator.dump_freelists();
+
+                if rng.gen() {
+                    allocations.shuffle(&mut rng);
+                    if let Some((block, layout)) = allocations.pop() {
+                        println!("============== rnd free ==============");
+                        println!("{block:p} {layout:?}");
+                        unsafe {
+                            allocator.deallocate(block.as_non_null_ptr(), layout);
+                        }
+                        allocator.dump_freelists();
+                    }
+                }
+            }
+
+            allocations.shuffle(&mut rng);
+            while let Some((block, layout)) = allocations.pop() {
+                println!("============== rnd free end ==============");
+                allocator.dump_freelists();
+                unsafe {
+                    allocator.deallocate(block.as_non_null_ptr(), layout);
+                }
+                println!("============== dump after ================");
+                allocator.dump_freelists();
+                println!("============== /rnd free end ==============");
+            }
+
+            // Check that frees all the memory
+            assert_eq!(allocator.memory_available(), usable_memory);
 
             backing.test_destroy();
         }
