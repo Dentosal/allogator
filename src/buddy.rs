@@ -675,12 +675,6 @@ impl BuddyAllocator {
                     }
 
                     #[cfg(feature = "extra-checks")]
-                    log::trace!("block = {:?}", block);
-                    log::trace!("[block] = {:?}", ptr::read(block.as_ptr()));
-                    log::trace!("frelh = {:?}", freelist_head);
-                    log::trace!("[frelh] = {:?}", ptr::read(freelist_head.as_ptr()));
-
-                    #[cfg(feature = "extra-checks")]
                     LLHeader::do_checks(freelist_head, level);
                     #[cfg(feature = "extra-checks")]
                     LLHeader::do_checks(block, level);
